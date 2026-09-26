@@ -38,6 +38,21 @@ async function readJson(res) {
   }
 }
 
+/* любая ошибка сети или разбора показывается человеку понятным текстом */
+function friendlyError(err) {
+  const msg = (err && err.message) || '';
+  if (/non-whitespace character after JSON|Unexpected token|not valid JSON|Unexpected end of JSON/i.test(msg)) {
+    return 'сервер ответил не JSON — между браузером и сайтом стоит прокси, который режет тело запроса';
+  }
+  if (err && err.status === 413) {
+    return 'прокси не пропускает тело запроса — возьмите файл поменьше или откройте сайт локально: cd app && npm start';
+  }
+  if (err && err.status === 0) {
+    return 'сеть отвалилась на середине загрузки — проверьте соединение и попробуйте снова';
+  }
+  return msg || 'что-то пошло не так';
+}
+
 function notJsonHint(data) {
   if (!data || !data.__notJson) return null;
   return `сервер ответил ${data.status || '?'} и не JSON — похоже, тело или ответ режет прокси между браузером и сайтом`;
@@ -194,7 +209,7 @@ async function handleFile(file) {
     state.job = null;
     onSourceReady();
   } catch (err) {
-    localError(err.message || 'не удалось загрузить файл');
+    localError(friendlyError(err));
   }
 }
 
@@ -209,7 +224,7 @@ function sendChunk(headers, blob) {
       let data = {};
       try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
       if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
-      const err = new Error(data.error || `сервер ответил ${xhr.status}`);
+      const err = new Error(friendlyError({ status: xhr.status, message: data.error || `сервер ответил ${xhr.status}` }));
       err.status = xhr.status;
       reject(err);
     };
@@ -553,7 +568,7 @@ async function startCut() {
     data = await readJson(res);
     if (!res.ok) throw new Error(notJsonHint(data) || data.error || 'сервер отказал');
   } catch (err) {
-    showPanelError(err.message);
+    showPanelError(friendlyError(err));
     return;
   }
 
@@ -581,7 +596,7 @@ async function pollJob() {
   } catch (err) {
     clearInterval(state.poll);
     state.poll = null;
-    showPanelError(err.message || 'связь с сервером потеряна');
+    showPanelError(friendlyError(err));
   }
 }
 
