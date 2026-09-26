@@ -638,6 +638,11 @@ function renderResults(job) {
       img.loading = 'lazy';
       img.alt = `превью куска ${r.index + 1}`;
       img.src = `${r.thumbUrl}?t=${job.id}`;
+      // если превью-кадра нет (ffmpeg не смог) — не показываем битую картинку
+      img.onerror = () => {
+        img.remove();
+        thumb.classList.add('is-missing');
+      };
       thumb.appendChild(img);
     }
 

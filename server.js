@@ -135,7 +135,7 @@ function cutPiece(input, output, start, duration, mode, onProgress) {
   });
 }
 
-function makeThumb(input, at, output) {
+function grabFrame(input, at, output) {
   return new Promise((resolve, reject) => {
     ffmpeg(input)
       .inputOptions(['-ss', Math.max(0, at).toFixed(3)])
@@ -145,6 +145,18 @@ function makeThumb(input, at, output) {
       .on('error', (err) => reject(err))
       .run();
   });
+}
+
+/* превью-кадр: пробуем середину куска, потом начало, потом первый кадр вообще */
+async function makeThumb(input, duration, output) {
+  const attempts = [duration / 2, Math.min(0.05, duration), 0];
+  for (const at of attempts) {
+    try {
+      await grabFrame(input, at, output);
+      if (fs.existsSync(output) && fs.statSync(output).size > 0) return;
+    } catch (_) { /* пробуем следующую точку */ }
+  }
+  throw new Error('не удалось вырезать превью-кадр');
 }
 
 function tc(seconds, withTenths) {
@@ -632,7 +644,7 @@ async function runJob(job) {
 
     // превью-кадр из середины куска
     try {
-      await makeThumb(out, p.duration / 2, path.join(thumbsDir, `${String(i + 1).padStart(2, '0')}.jpg`));
+      await makeThumb(out, p.duration, path.join(thumbsDir, `${String(i + 1).padStart(2, '0')}.jpg`));
     } catch (_) { /* превью необязательно */ }
   }
 
