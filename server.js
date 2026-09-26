@@ -183,7 +183,14 @@ const upload = multer({
   limits: { fileSize: MAX_UPLOAD, files: 1 },
 });
 
-app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '1h' }));
+app.use(express.static(PUBLIC_DIR, {
+  extensions: ['html'],
+  maxAge: 0,
+  setHeaders: (res) => {
+    // правки клиента должны доезжать сразу, без часового кэша
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+  },
+}));
 app.use('/media', express.static(JOB_DIR, { maxAge: 0, fallthrough: false }));
 
 /* список задач — чтобы страница после перезагрузки восстановила результат */
@@ -208,6 +215,7 @@ app.get('/api/jobs', (req, res) => {
       plan: j.plan,
       results: publicResults(j),
       totalSize: j.results.reduce((s, r) => s + (r.size || 0), 0),
+      uploadAvailable: uploads.has(j.fileId),
       progress: j.progress,
       error: j.error,
     }));
@@ -272,9 +280,15 @@ function safeExt(name) {
   return ext || '.mp4';
 }
 
+const uploadState = new Map(); // id -> {dir, target, name, size, total, attempt, chunks: Map, sum}
+
 app.post('/api/upload-chunk', async (req, res) => {
   const id = String(req.headers['x-upload-id'] || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-  const name = String(req.headers['x-file-name'] || 'video').slice(0, 260);
+  const rawName = String(req.headers['x-file-name'] || '').slice(0, 600);
+  let name = 'video';
+  try { name = decodeURIComponent(rawName); } catch (_) { name = rawName; }
+  name = name.replace(/[\u0000-\u001f\/\\]/g, '_').slice(0, 260) || 'video';
+  const attempt = String(req.headers['x-attempt'] || '').slice(0, 64);
   const index = Number(req.headers['x-chunk-index']);
   const total = Number(req.headers['x-chunk-total']);
   const offset = Number(req.headers['x-chunk-offset']);
@@ -298,7 +312,18 @@ app.post('/api/upload-chunk', async (req, res) => {
 
   try {
     fs.mkdirSync(dir, { recursive: true });
-    if (!fs.existsSync(target)) fs.writeFileSync(target, Buffer.alloc(0));
+
+    // куски приходят параллельно и в любом порядке, последний может быть
+    // самым маленьким — поэтому сборку подтверждает /api/upload-finish.
+    // новая попытка (другой размер куска) узнаётся по токену attempt
+    let st = uploadState.get(id);
+    if (!st || st.attempt !== attempt) {
+      st = { dir, target, name, size: fileSize, total, attempt, chunks: new Map(), sum: 0 };
+      uploadState.set(id, st);
+      if (!fs.existsSync(target)) fs.writeFileSync(target, Buffer.alloc(0));
+    } else if (st.total !== total || st.size !== fileSize) {
+      return res.status(400).json({ error: 'размер куска разошёлся внутри попытки' });
+    }
 
     const parts = [];
     for await (const part of req) parts.push(part);
@@ -309,37 +334,62 @@ app.post('/api/upload-chunk', async (req, res) => {
 
     const fh = await fs.promises.open(target, 'r+');
     try {
-      if (index === 0) await fh.truncate(0);
       await fh.write(buf, 0, buf.length, offset);
-      if (index === total - 1) await fh.truncate(fileSize);
     } finally {
       await fh.close();
     }
 
-    if (index === 0 || index === total - 1) {
-      fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({ name, size: fileSize }));
-    }
+    st.chunks.set(index, len);
+    st.sum = [...st.chunks.values()].reduce((a, b) => a + b, 0);
+    return res.json({ ok: true, received: offset + len, complete: st.sum === fileSize });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || 'не удалось принять чанк' });
+  }
+});
 
-    if (index < total - 1) return res.json({ ok: true, received: offset + len });
+app.post('/api/upload-finish', async (req, res) => {
+  const id = String((req.body && req.body.uploadId) || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  const size = Number(req.body && req.body.size);
+  const total = Number(req.body && req.body.total);
+  const attempt = String((req.body && req.body.attempt) || '').slice(0, 64);
+
+  const st = uploadState.get(id);
+  if (!st) return res.status(400).json({ error: 'загрузка не найдена — файл не добрался' });
+  if (st.size !== size || st.total !== total || (attempt && st.attempt !== attempt)) {
+    return res.status(400).json({ error: 'параметры загрузки разошлись' });
+  }
+  if (st.sum !== size) {
+    const missing = [];
+    for (let i = 0; i < total; i += 1) if (!st.chunks.has(i)) missing.push(i + 1);
+    return res.status(400).json({ error: `не долели куски: ${missing.slice(0, 8).join(', ')}` });
+  }
+
+  try {
+    const fh = await fs.promises.open(st.target, 'r+');
+    try { await fh.truncate(size); } finally { await fh.close(); }
 
     let info;
     try {
-      info = await probe(target);
+      info = await probe(st.target);
     } catch (_) {
-      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (__) {}
+      try { fs.rmSync(st.dir, { recursive: true, force: true }); } catch (__) {}
+      uploadState.delete(id);
       return res.status(415).json({ error: 'не похоже на видео — проверьте файл' });
     }
+
+    fs.writeFileSync(path.join(st.dir, 'meta.json'), JSON.stringify({ name: st.name, size }));
     const meta = {
       fileId: id,
-      name,
-      size: fs.statSync(target).size,
-      container: path.extname(target).slice(1),
+      name: st.name,
+      size,
+      container: path.extname(st.target).slice(1),
       ...info,
     };
     uploads.set(id, meta);
+    uploadState.delete(id);
     return res.json(meta);
   } catch (e) {
-    return res.status(500).json({ error: e.message || 'не удалось принять чанк' });
+    return res.status(500).json({ error: e.message || 'не удалось собрать файл' });
   }
 });
 

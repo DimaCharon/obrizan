@@ -98,4 +98,63 @@ function j(method, path, body) {
 
   console.log('— удаление');
   console.log('  ', (await j('DELETE', '/api/jobs/' + job2.id)).status, (await j('DELETE', '/api/uploads/' + meta.fileId)).status);
+
+  /* ── чанковая загрузка ─────────────────────────────────────── */
+  console.log('— чанковая загрузка');
+
+  async function chunked(filePath, fileName, chunkSize, opts = {}) {
+    const buf = fs.readFileSync(filePath);
+    const total = Math.ceil(buf.length / chunkSize);
+    const uploadId = 'chunktest' + Math.random().toString(16).slice(2, 8);
+    const attempt = 'att' + Math.random().toString(16).slice(2, 8);
+    const order = opts.reverse ? [...Array(total).keys()].reverse() : [...Array(total).keys()];
+    for (const i of order) {
+      if (opts.skip !== undefined && i === opts.skip) continue;
+      const start = i * chunkSize;
+      const piece = buf.subarray(start, Math.min(buf.length, start + chunkSize));
+      const r = await fetch(BASE + '/api/upload-chunk', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'x-upload-id': uploadId,
+          'x-attempt': attempt,
+          'x-file-name': encodeURIComponent(fileName),
+          'x-file-size': String(buf.length),
+          'x-chunk-index': String(i),
+          'x-chunk-total': String(total),
+          'x-chunk-offset': String(start),
+          'x-chunk-len': String(piece.length),
+        },
+        body: piece,
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) return { status: r.status, error: d.error, uploadId, total };
+    }
+    const f = await fetch(BASE + '/api/upload-finish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uploadId, name: fileName, size: buf.length, total, attempt }),
+    });
+    const d = await f.json().catch(() => ({}));
+    return { status: f.status, data: d, uploadId, total };
+  }
+
+  // имя с кириллицей, куски в обратном порядке — последний приезжает первым
+  let r = await chunked('/home/user/testdata/Запись звонка — 108 МБ.mp4', 'Запись звонка — 108 МБ.mp4', 4194304, { reverse: true });
+  console.log('  кириллица + обратный порядок →', r.status, JSON.stringify(r.data || r.error));
+
+  // не-видео
+  fs.writeFileSync('/tmp/notvideo.bin', 'это точно не видео');
+  r = await chunked('/tmp/notvideo.bin', 'notvideo.bin', 4096);
+  console.log('  не-видео →', r.status, r.data && r.data.error);
+
+  // недосланный кусок
+  r = await chunked(SRC, 'gappy.mp4', 4194304, { skip: 1 });
+  console.log('  без куска №2 →', r.status, r.data && r.data.error);
+
+  // неправильные заголовки
+  r = await fetch(BASE + '/api/upload-chunk', {
+    method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: 'x',
+  }).then(async (x) => ({ status: x.status }));
+  console.log('  без заголовков →', r.status);
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });

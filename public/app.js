@@ -209,18 +209,31 @@ function newUploadId() {
   return (Date.now().toString(16) + Math.random().toString(16).slice(2)).slice(0, 32);
 }
 
+function finishUpload(uploadId, name, size, total, attempt) {
+  return fetch('/api/upload-finish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uploadId, name, size, total, attempt }),
+  }).then(async (r) => {
+    const data = await r.json().catch(() => ({}));
+    if (r.ok && data.fileId) return data;
+    const err = new Error(data.error || `сервер ответил ${r.status}`);
+    err.status = r.status;
+    throw err;
+  });
+}
+
 async function uploadChunked(file) {
   const uploadId = newUploadId();
   let chunkSize = CHUNK_START;
   let confirmed = 0;
-  let result = null;
 
   for (;;) {
     const total = Math.max(1, Math.ceil(file.size / chunkSize));
+    const attempt = newUploadId();
     let next = 0;
     let failure = null;
     confirmed = 0;
-    result = null;
 
     const worker = async () => {
       for (;;) {
@@ -235,7 +248,8 @@ async function uploadChunked(file) {
           const data = await sendChunk({
             'Content-Type': 'application/octet-stream',
             'x-upload-id': uploadId,
-            'x-file-name': file.name,
+            'x-attempt': attempt,
+            'x-file-name': encodeURIComponent(file.name),
             'x-file-size': String(file.size),
             'x-chunk-index': String(i),
             'x-chunk-total': String(total),
@@ -245,7 +259,6 @@ async function uploadChunked(file) {
           confirmed += len;
           el.uploadbarFill.style.width = `${Math.min(100, Math.round((confirmed / file.size) * 100))}%`;
           el.uploadStatus.textContent = `загружаем «${file.name}»… ${Math.min(100, Math.round((confirmed / file.size) * 100))}%`;
-          if (data && data.fileId) result = data;
         } catch (err) {
           if (err.status === 413 && chunkSize > CHUNK_MIN) { failure = 'shrink'; return; }
           if (err.status === 413) {
@@ -265,8 +278,8 @@ async function uploadChunked(file) {
       continue;
     }
     if (failure) throw failure;
-    if (result) return result;
-    throw new Error('загрузка не завершилась');
+    // все куски на диске — просим сервер собрать и проверить файл
+    return await finishUpload(uploadId, file.name, file.size, total, attempt);
   }
 }
 
@@ -774,7 +787,7 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.modal.
     setStatus('восстановлен прошлый результат', 'ok');
 
     // если исходник ещё на сервере — поднимаем и панель управления
-    try {
+    if (job.uploadAvailable) try {
       const r2 = await fetch(`/api/uploads/${job.fileId}`);
       if (r2.ok) {
         const meta = await r2.json();
