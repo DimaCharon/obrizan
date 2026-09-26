@@ -28,6 +28,21 @@ const state = {
 
 /* ── форматирование ─────────────────────────────────────────── */
 
+/* ответ может быть не JSON: прокси иногда отдаёт 413 простым текстом,
+   и JSON.parse падает с «Unexpected non-whitespace character after JSON» */
+async function readJson(res) {
+  try {
+    return await res.json();
+  } catch (_) {
+    return { __notJson: true, status: res.status };
+  }
+}
+
+function notJsonHint(data) {
+  if (!data || !data.__notJson) return null;
+  return `сервер ответил ${data.status || '?'} и не JSON — похоже, тело или ответ режет прокси между браузером и сайтом`;
+}
+
 function fmtTime(sec, tenths = false) {
   const s = Math.max(0, Number(sec) || 0);
   const h = Math.floor(s / 3600);
@@ -215,7 +230,7 @@ function finishUpload(uploadId, name, size, total, attempt) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ uploadId, name, size, total, attempt }),
   }).then(async (r) => {
-    const data = await r.json().catch(() => ({}));
+    const data = await readJson(r);
     if (r.ok && data.fileId) return data;
     const err = new Error(data.error || `сервер ответил ${r.status}`);
     err.status = r.status;
@@ -404,8 +419,11 @@ async function refreshPlan() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fileId: state.file.fileId, pieces: state.pieces, overlap: state.overlap }),
     });
-    const data = await res.json();
-    if (!res.ok) { showPanelError(data.error || 'не удалось построить план'); return; }
+    const data = await readJson(res);
+    if (!res.ok) {
+      showPanelError(notJsonHint(data) || data.error || 'не удалось построить план');
+      return;
+    }
     state.plan = data.plan;
     renderTimeline();
     renderReadout();
@@ -532,8 +550,8 @@ async function startCut() {
         mode: state.mode,
       }),
     });
-    data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'сервер отказал');
+    data = await readJson(res);
+    if (!res.ok) throw new Error(notJsonHint(data) || data.error || 'сервер отказал');
   } catch (err) {
     showPanelError(err.message);
     return;
@@ -551,8 +569,8 @@ async function pollJob() {
   if (!state.job) return;
   try {
     const res = await fetch(`/api/jobs/${state.job.id}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
+    const data = await readJson(res);
+    if (!res.ok) throw new Error(data.error || `сервер ответил ${res.status}`);
     state.job = data.job;
     updateProgress(state.job);
     if (state.job.status === 'done' || state.job.status === 'error') {
@@ -767,7 +785,7 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.modal.
 (async function restore() {
   try {
     const res = await fetch('/api/jobs');
-    const data = await res.json();
+    const data = await readJson(res);
     const job = data.jobs && data.jobs[0];
     if (!job || job.status !== 'done') return;
     if (!job.results.some((r) => r.exists !== false)) return;

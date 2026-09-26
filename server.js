@@ -195,12 +195,16 @@ const upload = multer({
   limits: { fileSize: MAX_UPLOAD, files: 1 },
 });
 
+// HTML не кэшируем вообще, ассеты — с обязательной проверкой. Прокси превью
+// тоже умеет кэшировать, поэтому у ассетов в URL есть версия (см. index.html).
 app.use(express.static(PUBLIC_DIR, {
   extensions: ['html'],
   maxAge: 0,
-  setHeaders: (res) => {
-    // правки клиента должны доезжать сразу, без часового кэша
-    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+  setHeaders: (res, filePath) => {
+    const isHtml = String(filePath).endsWith('.html');
+    // no-cache заставляет браузер (и прокси) перепровердать файл по ETag,
+    // а смена ?v= в index.html гарантированно сбрасывает кэш целиком
+    res.setHeader('Cache-Control', isHtml ? 'no-store, must-revalidate' : 'no-cache, must-revalidate');
   },
 }));
 app.use('/media', express.static(JOB_DIR, { maxAge: 0, fallthrough: false }));
