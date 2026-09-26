@@ -1,0 +1,14 @@
+# рантайм
+data/
+node_modules/
+
+# логи и мусор
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# редакторы
+.idea/
+.vscode/
+*.swp
