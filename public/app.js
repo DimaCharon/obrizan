@@ -12,8 +12,9 @@ const MIN_SEGMENT = 1.5;
 const MAX_PIECES = 80;
 const MULTIPART_LIMIT = 8 * 1024 ** 2;   // до 8 МБ грузим одним запросом
 const CHUNK_START = 4 * 1024 ** 2;       // стартовый размер куска
-const CHUNK_MIN = 128 * 1024;            // минимальный размер куска
+const CHUNK_MIN = 32 * 1024;             // минимальный размер куска (прокси бывает жадным)
 const CHUNK_WORKERS = 3;                 // параллельные запросы
+const CHUNK_TRIES = 3;                   // попыток на кусок до уменьшения размера
 
 const state = {
   file: null,        // мета исходника с сервера
@@ -145,6 +146,7 @@ const el = {
   grid: $('#grid'),
   zipBtn: $('#zipBtn'),
   recutBtn: $('#recutBtn'),
+  newBtn: $('#newBtn'),
   modal: $('#modal'),
   modalVideo: $('#modalVideo'),
   modalTitle: $('#modalTitle'),
@@ -203,8 +205,21 @@ async function handleFile(file) {
   el.uploadStatus.textContent = `загружаем «${file.name}»… 0%`;
   setStatus('загружаем', 'busy');
 
+  const chunked = file.size > MULTIPART_LIMIT;
+
   try {
-    const meta = file.size > MULTIPART_LIMIT ? await uploadChunked(file) : await uploadFile(file);
+    let meta;
+    try {
+      meta = chunked ? await uploadChunked(file) : await uploadFile(file);
+    } catch (err) {
+      // прокси не пропустил тело одним запросом — шлём тот же файл кусками
+      if (!chunked && (err.status === 413 || err.status === 0 || err.network)) {
+        el.uploadStatus.textContent = `загружаем «${file.name}»… кусками`;
+        meta = await uploadChunked(file);
+      } else {
+        throw err;
+      }
+    }
     state.file = meta;
     state.job = null;
     onSourceReady();
@@ -215,21 +230,32 @@ async function handleFile(file) {
 
 /* ── загрузка кусками ───────────────────────────────────────── */
 
-function sendChunk(headers, blob) {
+/* Прокси между браузером и сайтом на большом теле может не только ответить
+   413, но и просто оборвать соединение — тогда приходит onerror со status 0.
+   Оба случая означают одно: кусок не прошёл по размеру, надо резать мельче. */
+function sendChunk(headers, blob, query) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload-chunk');
+    xhr.open('POST', `/api/upload-chunk?${query}`);
     Object.keys(headers).forEach((k) => xhr.setRequestHeader(k, headers[k]));
+    let settled = false;
+    const fail = (msg, status, network) => {
+      if (settled) return;
+      settled = true;
+      const err = new Error(msg);
+      err.status = status;
+      err.network = !!network;
+      reject(err);
+    };
     xhr.onload = () => {
       let data = {};
       try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
-      if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
-      const err = new Error(friendlyError({ status: xhr.status, message: data.error || `сервер ответил ${xhr.status}` }));
-      err.status = xhr.status;
-      reject(err);
+      if (xhr.status >= 200 && xhr.status < 300) { settled = true; return resolve(data); }
+      fail(friendlyError({ status: xhr.status, message: data.error || `сервер ответил ${xhr.status}` }), xhr.status);
     };
-    xhr.onerror = () => { const err = new Error('сеть отвалилась на середине загрузки'); err.status = 0; reject(err); };
-    xhr.onabort = () => { const err = new Error('загрузка прервана'); err.status = 0; reject(err); };
+    xhr.onerror = () => fail('сеть отвалилась на середине загрузки — соединение оборвалось', 0, true);
+    xhr.onabort = () => fail('загрузка прервана', 0, true);
+    xhr.ontimeout = () => fail('сервер не ответил вовремя', 0, true);
     xhr.send(blob);
   });
 }
@@ -240,7 +266,8 @@ function newUploadId() {
 }
 
 function finishUpload(uploadId, name, size, total, attempt) {
-  return fetch('/api/upload-finish', {
+  const q = new URLSearchParams({ id: uploadId, a: attempt, s: String(size), t: String(total) }).toString();
+  return fetch(`/api/upload-finish?${q}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ uploadId, name, size, total, attempt }),
@@ -262,7 +289,8 @@ async function uploadChunked(file) {
     const total = Math.max(1, Math.ceil(file.size / chunkSize));
     const attempt = newUploadId();
     let next = 0;
-    let failure = null;
+    let failure = null;      // Error — настоящая ошибка, загрузку бросаем
+    let shrinkWith = null;   // Error — кусок не прошёл по размеру, режем мельче
     confirmed = 0;
 
     const worker = async () => {
@@ -274,40 +302,58 @@ async function uploadChunked(file) {
         const start = i * chunkSize;
         const end = Math.min(file.size, start + chunkSize);
         const len = end - start;
-        try {
-          const data = await sendChunk({
-            'Content-Type': 'application/octet-stream',
-            'x-upload-id': uploadId,
-            'x-attempt': attempt,
-            'x-file-name': encodeURIComponent(file.name),
-            'x-file-size': String(file.size),
-            'x-chunk-index': String(i),
-            'x-chunk-total': String(total),
-            'x-chunk-offset': String(start),
-            'x-chunk-len': String(len),
-          }, file.slice(start, end));
-          confirmed += len;
-          el.uploadbarFill.style.width = `${Math.min(100, Math.round((confirmed / file.size) * 100))}%`;
-          el.uploadStatus.textContent = `загружаем «${file.name}»… ${Math.min(100, Math.round((confirmed / file.size) * 100))}%`;
-        } catch (err) {
-          if (err.status === 413 && chunkSize > CHUNK_MIN) { failure = 'shrink'; return; }
-          if (err.status === 413) {
-            failure = new Error(`прокси не пропускает тело запроса больше ${fmtSize(chunkSize)} — откройте сайт локально: cd app && npm start`);
-            return;
+        const headers = {
+          'Content-Type': 'application/octet-stream',
+          'x-upload-id': uploadId,
+          'x-attempt': attempt,
+          'x-file-name': encodeURIComponent(file.name),
+          'x-file-size': String(file.size),
+          'x-chunk-index': String(i),
+          'x-chunk-total': String(total),
+          'x-chunk-offset': String(start),
+          'x-chunk-len': String(len),
+        };
+
+        // те же данные в query: прокси может срезать нестандартные заголовки
+        const query = new URLSearchParams({
+          id: uploadId, a: attempt, i: String(i), t: String(total),
+          o: String(start), l: String(len), s: String(file.size), n: file.name,
+        }).toString();
+
+        let sent = false;
+        let lastErr = null;
+        for (let tries = 0; tries < CHUNK_TRIES && !failure && !shrinkWith; tries += 1) {
+          try {
+            await sendChunk(headers, file.slice(start, end), query);
+            sent = true;
+            break;
+          } catch (err) {
+            lastErr = err;
+            // 413 — прокси назвал лимит прямо, режем кусок сразу
+            if (err.status === 413) { shrinkWith = err; return; }
+            // ответ сервера — это уже настоящая ошибка, дальше не пробуем
+            if (!err.network) { failure = err; return; }
+            // обрыв соединения: обычно тело не пропустили по размеру, но может
+            // быть и моргнувшая сеть — поэтому кусок пробуем ещё раз
           }
-          failure = err;
-          return;
         }
+        if (!sent) { shrinkWith = lastErr; return; }
+
+        confirmed += len;
+        const pct = Math.min(100, Math.round((confirmed / file.size) * 100));
+        el.uploadbarFill.style.width = `${pct}%`;
+        el.uploadStatus.textContent = `загружаем «${file.name}»… ${pct}%`;
       }
     };
 
     await Promise.all(Array.from({ length: CHUNK_WORKERS }, worker));
 
-    if (failure === 'shrink') {
+    if (failure) throw failure;
+    if (shrinkWith) {
+      if (chunkSize <= CHUNK_MIN) throw shrinkWith;
       chunkSize = Math.max(CHUNK_MIN, Math.floor(chunkSize / 2));
       continue;
     }
-    if (failure) throw failure;
     // все куски на диске — просим сервер собрать и проверить файл
     return await finishUpload(uploadId, file.name, file.size, total, attempt);
   }
@@ -328,10 +374,18 @@ function uploadFile(file) {
     xhr.onload = () => {
       let data = {};
       try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
-      if (xhr.status >= 200 && xhr.status < 300 && data.fileId) resolve(data);
-      else reject(new Error(data.error || `сервер ответил ${xhr.status}`));
+      if (xhr.status >= 200 && xhr.status < 300 && data.fileId) { resolve(data); return; }
+      // status нужен вызывающему коду: по 413 он поймёт, что тело не пропустили
+      const err = new Error(data.error || `сервер ответил ${xhr.status}`);
+      err.status = xhr.status;
+      reject(err);
     };
-    xhr.onerror = () => reject(new Error('сеть отвалилась на середине загрузки'));
+    xhr.onerror = () => {
+      const err = new Error('сеть отвалилась на середине загрузки');
+      err.status = 0;
+      err.network = true;
+      reject(err);
+    };
     xhr.send(fd);
   });
 }
@@ -345,6 +399,8 @@ function onSourceReady() {
   el.results.hidden = true;
   el.progressCard.hidden = true;
   el.panelError.hidden = true;
+  el.uploadbar.hidden = true;
+  el.uploadStatus.hidden = true;
 
   el.srcName.textContent = f.name;
   el.srcMeta.innerHTML = [
@@ -636,6 +692,7 @@ function finishJob(job) {
   el.cutBtn.disabled = false;
   el.progressCard.hidden = true;
   el.results.hidden = false;
+  el.newBtn.hidden = true;
   renderResults(job);
 
   const okCount = job.results.filter((r) => r.status === 'done').length;
@@ -735,15 +792,33 @@ function renderResults(job) {
 /* ── архив ──────────────────────────────────────────────────── */
 
 el.zipBtn.addEventListener('click', () => {
-  if (!state.job) return;
+  const job = state.job;
+  if (!job) return;
   setStatus('собираем архив', 'busy');
-  window.location.href = `/api/jobs/${state.job.id}/zip`;
-  setTimeout(() => setStatus(state.job.status === 'done' ? 'готово' : 'в работе', 'ok'), 2500);
+  window.location.href = `/api/jobs/${job.id}/zip`;
+  // job держим в замыкании: за 2.5 с пользователь может успеть нажать «убрать»
+  setTimeout(() => setStatus(job.status === 'done' ? 'готово' : 'в работе', 'ok'), 2500);
 });
 
 el.recutBtn.addEventListener('click', () => {
   el.results.hidden = true;
   el.panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
+/* восстановленный запуск, исходник которого уже удалён: возвращаем загрузку */
+el.newBtn.addEventListener('click', () => {
+  if (state.job) fetch(`/api/jobs/${state.job.id}`, { method: 'DELETE' }).catch(() => {});
+  state.job = null;
+  state.file = null;
+  state.plan = [];
+  el.panel.hidden = true;
+  el.results.hidden = true;
+  el.progressCard.hidden = true;
+  el.dropzone.hidden = false;
+  el.newBtn.hidden = true;
+  setStatus('готов к работе');
+  el.footerStat.textContent = 'ожидаю видео';
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 });
 
 el.resetBtn.addEventListener('click', () => {
@@ -807,8 +882,8 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.modal.
 
     state.job = job;
     el.progressCard.hidden = true;
-    el.dropzone.hidden = true;
     el.results.hidden = false;
+    el.newBtn.hidden = true;
     renderResults(job);
 
     const okCount = job.results.filter((r) => r.status === 'done').length;
@@ -847,7 +922,10 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.modal.
         syncControls();
         renderTimeline();
         renderReadout();
+        el.dropzone.hidden = true;
       }
     } catch (_) {}
+    // исходника нет — оставляем единственный выход: загрузить другое видео
+    if (el.dropzone.hidden === false && el.panel.hidden) el.newBtn.hidden = false;
   } catch (_) {}
 })();

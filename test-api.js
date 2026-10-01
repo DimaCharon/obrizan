@@ -140,7 +140,7 @@ function j(method, path, body) {
   }
 
   // имя с кириллицей, куски в обратном порядке — последний приезжает первым
-  let r = await chunked('/home/user/testdata/Запись звонка — 108 МБ.mp4', 'Запись звонка — 108 МБ.mp4', 4194304, { reverse: true });
+  let r = await chunked('/home/user/testdata/Звонок с клиентом — 12 сентября.mp4', 'Звонок с клиентом — 12 сентября.mp4', 4194304, { reverse: true });
   console.log('  кириллица + обратный порядок →', r.status, JSON.stringify(r.data || r.error));
 
   // не-видео

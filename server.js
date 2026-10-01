@@ -299,17 +299,24 @@ function safeExt(name) {
 const uploadState = new Map(); // id -> {dir, target, name, size, total, attempt, chunks: Map, sum}
 
 app.post('/api/upload-chunk', async (req, res) => {
-  const id = String(req.headers['x-upload-id'] || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-  const rawName = String(req.headers['x-file-name'] || '').slice(0, 600);
+  // метаданные чанка дублируются в query: часть прокси срезает нестандартные
+  // x- заголовки, а query доходит всегда
+  const q = req.query || {};
+  const id = String(req.headers['x-upload-id'] || q.id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  let rawName = '';
+  let nameEncoded = false;
+  if (req.headers['x-file-name']) { rawName = String(req.headers['x-file-name']).slice(0, 600); nameEncoded = true; }
+  else if (q.n) { rawName = String(q.n).slice(0, 600); }
   let name = 'video';
-  try { name = decodeURIComponent(rawName); } catch (_) { name = rawName; }
+  if (nameEncoded) { try { name = decodeURIComponent(rawName); } catch (_) { name = rawName; } }
+  else name = rawName;
   name = name.replace(/[\u0000-\u001f\/\\]/g, '_').slice(0, 260) || 'video';
-  const attempt = String(req.headers['x-attempt'] || '').slice(0, 64);
-  const index = Number(req.headers['x-chunk-index']);
-  const total = Number(req.headers['x-chunk-total']);
-  const offset = Number(req.headers['x-chunk-offset']);
-  const len = Number(req.headers['x-chunk-len']);
-  const fileSize = Number(req.headers['x-file-size']);
+  const attempt = String(req.headers['x-attempt'] || q.a || '').slice(0, 64);
+  const index = Number(req.headers['x-chunk-index'] ?? q.i);
+  const total = Number(req.headers['x-chunk-total'] ?? q.t);
+  const offset = Number(req.headers['x-chunk-offset'] ?? q.o);
+  const len = Number(req.headers['x-chunk-len'] ?? q.l);
+  const fileSize = Number(req.headers['x-file-size'] ?? q.s);
 
   if (!id) return res.status(400).json({ error: 'нет идентификатора загрузки' });
   if (!Number.isInteger(index) || index < 0 || !Number.isInteger(total) || total < 1 || index >= total) {
@@ -364,10 +371,12 @@ app.post('/api/upload-chunk', async (req, res) => {
 });
 
 app.post('/api/upload-finish', async (req, res) => {
-  const id = String((req.body && req.body.uploadId) || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-  const size = Number(req.body && req.body.size);
-  const total = Number(req.body && req.body.total);
-  const attempt = String((req.body && req.body.attempt) || '').slice(0, 64);
+  const q = req.query || {};
+  const b = req.body || {};
+  const id = String(b.uploadId || q.id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  const size = Number(b.size ?? q.s);
+  const total = Number(b.total ?? q.t);
+  const attempt = String(b.attempt || q.a || '').slice(0, 64);
 
   const st = uploadState.get(id);
   if (!st) return res.status(400).json({ error: 'загрузка не найдена — файл не добрался' });
