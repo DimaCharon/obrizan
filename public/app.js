@@ -25,6 +25,8 @@ const state = {
   pieces: 20,
   overlap: 1.5,
   mode: 'accurate',
+  enhance: false,
+  upscale: false,
   plan: [],
   job: null,
   poll: null,
@@ -163,6 +165,9 @@ const el = {
   overlapSeg: $('#overlapSeg'),
   modeSeg: $('#modeSeg'),
   modeNote: $('#modeNote'),
+  enhanceChk: $('#enhanceChk'),
+  upscaleChk: $('#upscaleChk'),
+  picNote: $('#picNote'),
   roTotal: $('#roTotal'),
   roEach: $('#roEach'),
   roEachNote: $('#roEachNote'),
@@ -507,6 +512,8 @@ function syncControls() {
   $$('#chips button').forEach((b) => b.classList.toggle('is-active', Number(b.dataset.pieces) === state.pieces));
   $$('#overlapSeg button').forEach((b) => b.classList.toggle('is-active', Number(b.dataset.overlap) === state.overlap));
   $$('#modeSeg button').forEach((b) => b.classList.toggle('is-active', b.dataset.mode === state.mode));
+  el.enhanceChk.checked = state.enhance;
+  el.upscaleChk.checked = state.upscale;
   el.modeNote.textContent = state.mode === 'accurate'
     ? 'перекодирование — границы точные, дольше'
     : 'копия потока — быстро, границы по ключевым кадрам';
@@ -514,6 +521,20 @@ function syncControls() {
   const each = state.file ? state.file.duration / state.pieces + state.overlap : 0;
   el.cutBtnSub.textContent = `${state.pieces} ${plural(state.pieces, 'кусок', 'куска', 'кусков')} · ≈ ${fmtTime(each, true)} каждый`;
   el.roFormat.textContent = state.mode === 'accurate' ? 'mp4 · h.264' : 'копия потока';
+
+  // подсказка про картинку: что реально сделает ffmpeg
+  const picked = [];
+  if (state.enhance) picked.push('шум уберём, резкость вернём');
+  if (state.upscale) picked.push('разрешение ×2');
+  if (!picked.length) {
+    el.picNote.textContent = state.mode === 'accurate'
+      ? 'как в исходнике — качество сохраняется'
+      : 'копия потока — качество исходника без изменений';
+  } else {
+    el.picNote.textContent = state.mode === 'fast'
+      ? `${picked.join(', ')} — filters требуют перекодирования, поэтому куски будут точными`
+      : `${picked.join(', ')} — дольше и файлы больше`;
+  }
 }
 
 el.piecesRange.addEventListener('input', () => { state.pieces = Number(el.piecesRange.value); syncControls(); schedulePlan(); });
@@ -531,6 +552,8 @@ el.overlapSeg.addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   state.overlap = Number(b.dataset.overlap); syncControls(); schedulePlan();
 });
+el.enhanceChk.addEventListener('change', () => { state.enhance = el.enhanceChk.checked; syncControls(); schedulePlan(); });
+el.upscaleChk.addEventListener('change', () => { state.upscale = el.upscaleChk.checked; syncControls(); schedulePlan(); });
 el.modeSeg.addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
   state.mode = b.dataset.mode; syncControls();
@@ -698,6 +721,8 @@ async function startCut() {
         pieces: state.pieces,
         overlap: state.overlap,
         mode: state.mode,
+        enhance: state.enhance,
+        upscale: state.upscale,
       }),
     });
     data = await readJson(res);
@@ -991,6 +1016,8 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.modal.
         state.pieces = job.pieces;
         state.overlap = job.overlap;
         state.mode = job.mode;
+        state.enhance = !!job.enhance;
+        state.upscale = !!job.upscale;
         state.plan = job.plan;
         el.panel.hidden = false;
         el.srcName.textContent = meta.name;
