@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const express = require('express');
 const multer = require('multer');
@@ -16,8 +17,44 @@ const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 const archiver = require('archiver');
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobePath);
+/* В bundled ffmpeg-static лежит бинарник, скачанный под ту платформу, где
+   выполнялся npm install. Если хостинг собрал зависимости на одной машине,
+   а запускает на другой (другой glibc или архитектура), бинарник есть, путь
+   резолвится — но запустить его нельзя, и любая операция с видео падает уже
+   в рантайме. При этом само приложение стартует без ошибок, и в логах нет
+   ничего, кроме строчки о порту: диагностировать нечем.
+
+   Поэтому проверяем бинарник делелом и, если он не работает, откатываемся на
+   системный ffmpeg из PATH. Выбор всегда пишется в лог одной строкой. */
+function usable(bin) {
+  if (!bin) return false;
+  try {
+    execFileSync(bin, ['-version'], { stdio: ['ignore', 'ignore', 'ignore'], timeout: 15000 });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function pickBundled(bundled, fallbackName, label) {
+  if (usable(bundled)) return bundled;
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const cand = path.join(dir, fallbackName);
+    if (usable(cand)) {
+      console.log(`! bundled ${label} не запускается на этой машине — беру системный: ${cand}`);
+      return cand;
+    }
+  }
+  console.log(`! ${label} не работает ни bundled, ни системный — операции с видео будут падать`);
+  return bundled;   // пусть падает с понятной ошибкой, а не молча
+}
+
+const ffmpegBin = pickBundled(ffmpegPath, 'ffmpeg', 'ffmpeg');
+const ffprobeBin = pickBundled(ffprobePath, 'ffprobe', 'ffprobe');
+
+ffmpeg.setFfmpegPath(ffmpegBin);
+ffmpeg.setFfprobePath(ffprobeBin);
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -233,6 +270,52 @@ app.use(express.static(PUBLIC_DIR, {
 app.use('/media', express.static(JOB_DIR, { maxAge: 0, fallthrough: false }));
 
 /* список задач — чтобы страница после перезагрузки восстановила результат */
+/* Диагностика для чужого хостинга: одна команда показывает, поднялся ли
+   процесс и, главное, работает ли ffmpeg. Без неё 502 от прокси хостинга
+   неотличим от сломанного приложения — в логах просто нет строк. */
+/* Лог запросов. На чужом хостинге это единственный способ понять, доходят ли
+   запросы до приложения вообще: прокси отдаёт 502 своей страницей, и в логах
+   не остаётся ничего. Каждую строку пишем одной строкой, без перевода. */
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on('finish', () => {
+    const line = `${req.method} ${req.originalUrl} → ${res.statusCode} ${Date.now() - t0}мс`;
+    if (res.statusCode >= 500) console.log('ERR', line);
+    else console.log('req', line);
+  });
+  next();
+});
+
+app.get('/api/health', (req, res) => {
+  let ffmpegOk = false;
+  let ffmpegVer = null;
+  try {
+    ffmpegVer = execFileSync(ffmpegBin, ['-version'], { encoding: 'utf8', timeout: 15000 })
+      .split('\n')[0].slice(0, 80);
+    ffmpegOk = true;
+  } catch (e) {
+    ffmpegVer = String((e && e.message) || e).slice(0, 200);
+  }
+  let probeOk = false;
+  try {
+    execFileSync(ffprobeBin, ['-version'], { stdio: 'ignore', timeout: 15000 });
+    probeOk = true;
+  } catch (_) {}
+  const dirsOk = [UPLOAD_DIR, JOB_DIR].every((d) => {
+    try { fs.accessSync(d, fs.constants.W_OK); return true; } catch (_) { return false; }
+  });
+  res.json({
+    ok: ffmpegOk && probeOk && dirsOk,
+    node: process.version,
+    ffmpeg: { ok: ffmpegOk, bin: ffmpegBin, version: ffmpegVer },
+    ffprobe: { ok: probeOk, bin: ffprobeBin },
+    dirsWritable: dirsOk,
+    uploads: uploads.size,
+    jobs: jobs.size,
+    port: PORT,
+  });
+});
+
 app.get('/api/jobs', (req, res) => {
   const list = [...jobs.values()]
     .filter((j) => j.status !== 'done' || jobHasFiles(j))
@@ -774,6 +857,18 @@ async function restoreUploads() {
 })();
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'нет такого метода' }));
+
+/* Любая необработанная ошибка в маршруте по умолчанию отдаёт HTML-страницу
+   Express с кодом 500. Браузер показывает тогда «сервер ответил 500 и не JSON —
+   похоже, тело режет прокси», хотя прокси ни при чём и причина совершенно
+   другая. Отдаём JSON с настоящим текстом — он виден и в интерфейсе, и в логе. */
+app.use('/api', (err, req, res, next) => {
+  const msg = String((err && err.message) || err || 'неизвестная ошибка');
+  console.log('ERR api', req.method, req.originalUrl, '→', msg);
+  if (res.headersSent) return next(err);
+  res.status(err && err.status >= 400 && err.status < 600 ? err.status : 500)
+    .json({ error: msg });
+});
 
 (async function boot() {
   await restoreUploads();
