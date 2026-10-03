@@ -1,4 +1,13 @@
-import time, os, sys, json
+import time, os, sys, json, subprocess
+# фикстуры не хранятся в репозитории: снимок рабочей папки ограничен ~128 МБ,
+# и большой testdata вытесняет из него data/ с загруженными видео. Генерируем.
+import os as _os, subprocess as _sp
+_app = _os.path.dirname(_os.path.abspath(__file__))
+for _f in ("demo.mp4", "test.mp4", "\u0417\u0432\u043e\u043d\u043e\u043a \u0441 \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u043c \u2014 12 \u0441\u0435\u043d\u0442\u044f\u0431\u0440\u044f.mp4"):
+    if not _os.path.exists(_os.path.join("/home/user/testdata", _f)):
+        _sp.run(["bash", _os.path.join(_app, "make-fixtures.sh")], check=False)
+        break
+
 from playwright.sync_api import sync_playwright
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:4173"
@@ -132,6 +141,14 @@ with sync_playwright() as p:
     check("сетевых ошибок нет", len(bad) == 0, "; ".join(bad[:3]))
     ctx.close()
     b.close()
+
+# тот же мусор в data/, что и у test-ui-full.py — убираем, иначе снимок папки
+# переполняется и вытесняет оттуда загруженное пользователем видео
+try:
+    subprocess.run(["bash", os.path.join(os.path.dirname(os.path.abspath(__file__)), "clean.sh")],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+except Exception:
+    pass
 
 print("\n=== 40 МИНУТ: " + ("ПРОВАЛ " + str(len(fails)) if fails else "ВСЁ ЗЕЛЁНОЕ") + " ===")
 for f in fails:

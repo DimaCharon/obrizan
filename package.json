@@ -4,7 +4,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test-api.js"
+    "test": "node test-api.js",
+    "pretest": "bash make-fixtures.sh",
+    "clean": "bash clean.sh",
+    "fixtures": "bash make-fixtures.sh"
   },
   "keywords": [],
   "author": "",

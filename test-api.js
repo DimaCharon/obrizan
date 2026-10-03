@@ -7,6 +7,10 @@ const fp = require('/home/user/app/node_modules/ffprobe-static').path;
 
 const BASE = 'http://127.0.0.1:4173';
 const SRC = '/home/user/testdata/test.mp4';
+/* Всё, что тест создал на сервере. Убираем в конце через API — иначе data/
+   распухает на десятки мегабайт, а снимок рабочей папки ограничен ~128 МБ и
+   вытесняет оттуда загруженное пользователем видео. */
+const made = { uploads: [], jobs: [] };
 
 function j(method, path, body) {
   return fetch(BASE + path, {
@@ -38,6 +42,7 @@ function j(method, path, body) {
     fps: meta.fps, v: meta.videoCodec, a: meta.audioCodec, size: meta.size,
   }));
 
+  made.uploads.push(meta.fileId);
   const plan = await j('POST', '/api/plan', { fileId: meta.fileId, pieces: 8, overlap: 1.5 });
   console.log('— план →', plan.status, plan.data.plan.length, 'кусков');
   plan.data.plan.forEach((s) => console.log(`   #${s.index + 1} ${s.start.toFixed(2)} → ${s.end.toFixed(2)} (${s.duration.toFixed(2)}с)`));
@@ -46,6 +51,7 @@ function j(method, path, body) {
   const cut = await j('POST', '/api/cut', { fileId: meta.fileId, pieces: 8, overlap: 1.5, mode: 'accurate' });
   console.log('  cut →', cut.status, cut.data.job && cut.data.job.id, 'container:', cut.data.job && cut.data.job.container);
   const jobId = cut.data.job.id;
+  made.jobs.push(jobId);
 
   let job;
   for (let i = 0; i < 120; i += 1) {
@@ -82,6 +88,7 @@ function j(method, path, body) {
 
   console.log('— быстрый режим');
   const cut2 = await j('POST', '/api/cut', { fileId: meta.fileId, pieces: 5, overlap: 2, mode: 'fast' });
+  made.jobs.push(cut2.data.job.id);
   const j2 = cut2.data.job;
   let job2;
   for (let i = 0; i < 60; i += 1) {
@@ -157,4 +164,14 @@ function j(method, path, body) {
     method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: 'x',
   }).then(async (x) => ({ status: x.status }));
   console.log('  без заголовков →', r.status);
+
+  /* Убираем за собой в том же прогоне, а не надеемся на суточную чистку:
+     она рассчитана на возраст, а тестовый мусор свежий. Снимок рабочей папки
+     ограничен ~128 МБ, и распухшая data/ вытесняет из него загруженное
+     пользователем видео — тогда нарезка падает с «сервер перезапустился и
+     потерял временные файлы». */
+  for (const id of made.jobs) await fetch(BASE + '/api/jobs/' + id, { method: 'DELETE' }).catch(() => {});
+  for (const id of made.uploads) await fetch(BASE + '/api/uploads/' + id, { method: 'DELETE' }).catch(() => {});
+  const { execSync } = require('child_process');
+  try { execSync('./clean.sh', { stdio: 'ignore' }); } catch (_) {}
 })().catch((e) => { console.error('FAIL', e); process.exit(1); });

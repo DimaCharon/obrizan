@@ -1,4 +1,13 @@
-import time, json, os
+import time, json, os, re
+# фикстуры не хранятся в репозитории: снимок рабочей папки ограничен ~128 МБ,
+# и большой testdata вытесняет из него data/ с загруженными видео. Генерируем.
+import os as _os, subprocess as _sp
+_app = _os.path.dirname(_os.path.abspath(__file__))
+for _f in ("demo.mp4", "test.mp4", "\u0417\u0432\u043e\u043d\u043e\u043a \u0441 \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u043c \u2014 12 \u0441\u0435\u043d\u0442\u044f\u0431\u0440\u044f.mp4"):
+    if not _os.path.exists(_os.path.join("/home/user/testdata", _f)):
+        _sp.run(["bash", _os.path.join(_app, "make-fixtures.sh")], check=False)
+        break
+
 from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:4173"
@@ -118,7 +127,9 @@ with sync_playwright() as p:
     log(f"большой файл ({os.path.getsize(BIG)/1024/1024:.0f} МБ) загружен за {big_time:.1f}с")
     check("большой: панель открылась", True)
     check("большой: имя с кириллицей", any(c > "\u0400" for c in pg.inner_text("#srcName")), pg.inner_text("#srcName"))
-    check("большой: мета источника", "04:20" in pg.inner_text("#srcMeta") and "1280×720" in pg.inner_text("#srcMeta"), pg.inner_text("#srcMeta"))
+    _meta = pg.inner_text("#srcMeta")
+    check("большой: мета источника",
+          re.search(r"\d{2}:\d{2}\.\d длительность", _meta) and "1280×720" in _meta, _meta)
     log("источник: " + pg.inner_text("#srcName") + " · " + pg.inner_text("#srcMeta").replace("\n", " | "))
     log("readout: " + pg.inner_text("#readout").replace("\n", " | "))
     pg.screenshot(path=f"{OUT}/04-big.png", full_page=True)
@@ -164,8 +175,33 @@ with sync_playwright() as p:
     check("ошибок консоли нет", len(uniq) == 0, "; ".join(uniq[:3]))
     check("сетевых ошибок нет", len(bad) == 0, "; ".join(bad[:3]))
 
+    # запоминаем, что создали, пока браузер ещё жив
+    try:
+        _ids = pg.evaluate("() => ({ up: state.file && state.file.fileId, job: state.job && state.job.id })")
+    except Exception as _e:
+        _ids = {"err": str(_e)}
     ctx.close()
     b.close()
+
+# Браузерный тест оставляет в data/ десятки мегабайт: исходник, нарезку и архив.
+# Снимок рабочей папки ограничен ~128 МБ, и распухшая data/ вытесняет из него
+# загруженное пользователем видео — тогда нарезка падает с «сервер перезапустился
+# и потерял временные файлы». Убираем за собой в том же прогоне: сначала своё
+# через API, потом всё остальное тестовое скриптом.
+try:
+    import urllib.request as _u
+    for _kind, _path in (("job", "jobs"), ("up", "uploads")):
+        _id = (_ids or {}).get(_kind)
+        if _id:
+            _r = _u.urlopen(_u.Request(f"http://127.0.0.1:4173/api/{_path}/{_id}", method="DELETE"))
+
+except Exception:
+    pass
+try:
+    subprocess.run(["bash", os.path.join(_app, "clean.sh")],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+except Exception:
+    pass
 
 print("\n================ ИТОГИ ================")
 if fails:
