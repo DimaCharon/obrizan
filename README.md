@@ -12,10 +12,13 @@ Node + Express + ffmpeg (статический билд, ставить нич�
 ## Запуск
 
 ```bash
-cd app
-npm install     # один раз
-npm start       # http://localhost:4173
+git clone https://github.com/DimaCharon/obrizan.git
+cd obrizan
+./start.sh      # http://localhost:4173
 ```
+
+`./start.sh` сам поставит зависимости, если их нет, и поднимет сервер заново,
+если процесс упадёт. Если он почему-то не нужен — `npm install && npm start`.
 
 Другие порты: `PORT=8080 npm start`.
 Лимит загрузки по умолчанию 4 ГБ: `MAX_UPLOAD_BYTES=8589934592 npm start`.
@@ -132,7 +135,7 @@ PORT=8080 ./start.sh
 
 Если сайт открыт через чужой прокси превью, а тот оставляет вас с ошибкой 404
 на обрезке — значит прокси перезапустил контейнер и стёр временные файлы.
-Запустите локально: `cd app && ./start.sh`.
+Запустите локально: `cd obrizan && ./start.sh`.
 
 ## Проверка
 
