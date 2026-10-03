@@ -110,9 +110,18 @@ with sync_playwright() as p:
       json: friendlyError({ message: 'Unexpected non-whitespace character after JSON' }),
     })""")
     txt["j404"] = pg.evaluate("() => friendlyError({ status: 404, message: 'задача не найдена' })")
+    txt["j502"] = pg.evaluate("() => notJsonHint({ __notJson: true, status: 502 })")
+    txt["j503"] = pg.evaluate("() => notJsonHint({ __notJson: true, status: 503 })")
+    txt["j200"] = pg.evaluate("() => notJsonHint({ __notJson: true, status: 200 })")
     print("старые тексты:", txt)
     if txt["j404"] != "сервер перезапустился и потерял временные файлы — исходник и задача сброшены, загрузите видео заново":
         fails.append("сломался текст 404")
+    if txt["j502"] != "сайт за прокси не ответил (502) — сервер выключен или спит, а не режет тело запроса":
+        fails.append("сломался текст 502")
+    if txt["j503"] != "сайт за прокси не ответил (503) — сервер выключен или спит, а не режет тело запроса":
+        fails.append("сломался текст 503")
+    if not str(txt["j200"]).startswith("сервер ответил 200 и не JSON"):
+        fails.append("сломался обычный не-JSON текст")
     if txt["j413"] != "прокси не пропускает тело запроса — возьмите файл поменьше или откройте сайт локально: скачайте репозиторий и запустите ./start.sh":
         fails.append("сломался текст 413")
     if txt["j0"] != "сеть отвалилась на середине загрузки — проверьте соединение и попробуйте снова":
