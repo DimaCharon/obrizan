@@ -15,6 +15,10 @@ const CHUNK_START = 4 * 1024 ** 2;       // стартовый размер ку
 const CHUNK_MIN = 32 * 1024;             // минимальный размер куска (прокси бывает жадным)
 const CHUNK_WORKERS = 3;                 // параллельные запросы
 const CHUNK_TRIES = 3;                   // попыток на кусок до уменьшения размера
+const CHUNK_TIMEOUT = 120000;            // мс на кусок: дальше считаем соединение мёртвым
+const WHOLE_TIMEOUT = 240000;            // мс на загрузку целым файлом
+const API_TIMEOUT = 120000;              // мс на обычный запрос к сайту
+const FIRST_BYTE_TIMEOUT = 45000;         // мс: если целый файл вообще не поехал — уходим на куски
 
 const state = {
   file: null,        // мета исходника с сервера
@@ -39,11 +43,35 @@ async function readJson(res) {
   }
 }
 
+/* fetch с потолком по времени: зависший прокси иначе молчит вечно,
+   а человек видит только крутилку без единой подсказки */
+async function fetchJson(url, opts = {}, ms = API_TIMEOUT) {
+  const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), ms) : null;
+  try {
+    return await fetch(url, { ...opts, signal: ctl ? ctl.signal : undefined });
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      const e = new Error('сервер не ответил — запрос висел слишком долго');
+      e.status = 0;
+      e.network = true;
+      e.stalled = true;
+      throw e;
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /* любая ошибка сети или разбора показывается человеку понятным текстом */
 function friendlyError(err) {
   const msg = (err && err.message) || '';
   if (/non-whitespace character after JSON|Unexpected token|not valid JSON|Unexpected end of JSON/i.test(msg)) {
     return 'сервер ответил не JSON — между браузером и сайтом стоит прокси, который режет тело запроса';
+  }
+  if (err && err.stalled) {
+    return 'связь с сайтом подвисла — запрос не дошёл за отведённое время, попробуйте снова';
   }
   if (err && err.status === 413) {
     return 'прокси не пропускает тело запроса — возьмите файл поменьше или откройте сайт локально: cd app && npm start';
@@ -237,12 +265,13 @@ function sendChunk(headers, blob, query) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `/api/upload-chunk?${query}`);
+    xhr.timeout = CHUNK_TIMEOUT;
     Object.keys(headers).forEach((k) => xhr.setRequestHeader(k, headers[k]));
     let settled = false;
-    const fail = (msg, status, network) => {
+    const fail = (msg, status, network, src) => {
       if (settled) return;
       settled = true;
-      const err = new Error(msg);
+      const err = src || new Error(msg);
       err.status = status;
       err.network = !!network;
       reject(err);
@@ -255,7 +284,14 @@ function sendChunk(headers, blob, query) {
     };
     xhr.onerror = () => fail('сеть отвалилась на середине загрузки — соединение оборвалось', 0, true);
     xhr.onabort = () => fail('загрузка прервана', 0, true);
-    xhr.ontimeout = () => fail('сервер не ответил вовремя', 0, true);
+    // кусок завис — это сетевая ошибка: её повторят, а потом и размер урежут
+    xhr.ontimeout = () => {
+      const err = new Error('кусок завис — сервер не ответил за две минуты');
+      err.status = 0;
+      err.network = true;
+      err.stalled = true;
+      fail(err.message, 0, true, err);
+    };
     xhr.send(blob);
   });
 }
@@ -267,7 +303,7 @@ function newUploadId() {
 
 function finishUpload(uploadId, name, size, total, attempt) {
   const q = new URLSearchParams({ id: uploadId, a: attempt, s: String(size), t: String(total) }).toString();
-  return fetch(`/api/upload-finish?${q}`, {
+  return fetchJson(`/api/upload-finish?${q}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ uploadId, name, size, total, attempt }),
@@ -361,12 +397,33 @@ async function uploadChunked(file) {
 
 function uploadFile(file) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (firstByteTimer) clearTimeout(firstByteTimer);
+      fn(arg);
+    };
     const xhr = new XMLHttpRequest();
     const fd = new FormData();
     fd.append('video', file);
     xhr.open('POST', '/api/uploads');
+    xhr.timeout = WHOLE_TIMEOUT;
+    /* тело не ушло ни байтом — почти наверняка его режет прокси. Ждать четыре
+       минуты незачем: сразу пробуем тот же файл кусками, они проходят везде. */
+    let firstByteTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const err = new Error('загрузка не началась — тело запроса не пропускают');
+      err.status = 0;
+      err.network = true;
+      err.stalled = true;
+      reject(err);
+    }, FIRST_BYTE_TIMEOUT);
     xhr.upload.onprogress = (e) => {
       if (!e.lengthComputable) return;
+      // первый байт пошёл — считаем, что канал живой, и снимаем сторож
+      if (e.loaded > 0 && firstByteTimer) { clearTimeout(firstByteTimer); firstByteTimer = null; }
       const pct = Math.round((e.loaded / e.total) * 100);
       el.uploadbarFill.style.width = `${pct}%`;
       el.uploadStatus.textContent = `загружаем «${file.name}»… ${pct}%`;
@@ -374,17 +431,25 @@ function uploadFile(file) {
     xhr.onload = () => {
       let data = {};
       try { data = JSON.parse(xhr.responseText || '{}'); } catch (_) {}
-      if (xhr.status >= 200 && xhr.status < 300 && data.fileId) { resolve(data); return; }
+      if (xhr.status >= 200 && xhr.status < 300 && data.fileId) { done(resolve, data); return; }
       // status нужен вызывающему коду: по 413 он поймёт, что тело не пропустили
       const err = new Error(data.error || `сервер ответил ${xhr.status}`);
       err.status = xhr.status;
-      reject(err);
+      done(reject, err);
     };
     xhr.onerror = () => {
       const err = new Error('сеть отвалилась на середине загрузки');
       err.status = 0;
       err.network = true;
-      reject(err);
+      done(reject, err);
+    };
+    // целым файлом не уложились — не ошибка, вызывающий код уйдёт на куски
+    xhr.ontimeout = () => {
+      const err = new Error('загрузка целым файлом не уложилась в отведённое время');
+      err.status = 0;
+      err.network = true;
+      err.stalled = true;
+      done(reject, err);
     };
     xhr.send(fd);
   });
@@ -485,7 +550,7 @@ async function refreshPlan() {
   el.cutBtn.disabled = false;
 
   try {
-    const res = await fetch('/api/plan', {
+    const res = await fetchJson('/api/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ fileId: state.file.fileId, pieces: state.pieces, overlap: state.overlap }),
@@ -498,8 +563,8 @@ async function refreshPlan() {
     state.plan = data.plan;
     renderTimeline();
     renderReadout();
-  } catch (_) {
-    showPanelError('сервер не ответил');
+  } catch (err) {
+    showPanelError(friendlyError(err));
   }
 }
 
@@ -611,7 +676,7 @@ async function startCut() {
 
   let data;
   try {
-    const res = await fetch('/api/cut', {
+    const res = await fetchJson('/api/cut', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -639,7 +704,7 @@ async function startCut() {
 async function pollJob() {
   if (!state.job) return;
   try {
-    const res = await fetch(`/api/jobs/${state.job.id}`);
+    const res = await fetchJson(`/api/jobs/${state.job.id}`);
     const data = await readJson(res);
     if (!res.ok) throw new Error(data.error || `сервер ответил ${res.status}`);
     state.job = data.job;
@@ -874,7 +939,7 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.modal.
 
 (async function restore() {
   try {
-    const res = await fetch('/api/jobs');
+    const res = await fetchJson('/api/jobs');
     const data = await readJson(res);
     const job = data.jobs && data.jobs[0];
     if (!job || job.status !== 'done') return;
@@ -901,7 +966,7 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.modal.
 
     // если исходник ещё на сервере — поднимаем и панель управления
     if (job.uploadAvailable) try {
-      const r2 = await fetch(`/api/uploads/${job.fileId}`);
+      const r2 = await fetchJson(`/api/uploads/${job.fileId}`);
       if (r2.ok) {
         const meta = await r2.json();
         state.file = meta;
