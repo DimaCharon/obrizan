@@ -53,6 +53,24 @@ with sync_playwright() as p:
         fails.append("текст ошибки таймаута: " + str(out.get("friendly")))
     pg.unroute("**/api/plan")
 
+    # ── 3б. опрос задачи на 404 роняет понятную ошибку, а не «сервер ответил 404» ─
+    pg.route("**/api/jobs/*", lambda route: route.fulfill(status=404, content_type="application/json", body='{"error":"задача не найдена"}'))
+    # pollJob ошибку не бросает — он сам рисует её в панели, поэтому смотрим туда
+    out35 = pg.evaluate("""async () => {
+      state.job = { id: 'нет-такой' };
+      await pollJob();
+      const e = document.querySelector('#panelError');
+      return { hidden: e.hidden, text: e.textContent.trim(), pollStopped: state.poll === null };
+    }""")
+    print(f"pollJob на 404: {out35}")
+    if out35.get("hidden"):
+        fails.append("pollJob на 404 ничего не показал")
+    if not str(out35.get("text", "")).startswith("сервер перезапустился"):
+        fails.append("pollJob на 404 даёт не тот текст: " + str(out35.get("text")))
+    if not out35.get("pollStopped"):
+        fails.append("опрос не остановился после 404")
+    pg.unroute("**/api/jobs/*")
+
     # ── 4. целый файл, который не поехал, быстро уходит на куски ─
     pg.route("**/api/uploads", lambda route: None)
     t0 = time.time()
@@ -91,7 +109,10 @@ with sync_playwright() as p:
       j0:   friendlyError({ status: 0, message: 'network' }),
       json: friendlyError({ message: 'Unexpected non-whitespace character after JSON' }),
     })""")
+    txt["j404"] = pg.evaluate("() => friendlyError({ status: 404, message: 'задача не найдена' })")
     print("старые тексты:", txt)
+    if txt["j404"] != "сервер перезапустился и потерял временные файлы — исходник и задача сброшены, загрузите видео заново":
+        fails.append("сломался текст 404")
     if txt["j413"] != "прокси не пропускает тело запроса — возьмите файл поменьше или откройте сайт локально: cd app && npm start":
         fails.append("сломался текст 413")
     if txt["j0"] != "сеть отвалилась на середине загрузки — проверьте соединение и попробуйте снова":

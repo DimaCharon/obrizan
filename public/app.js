@@ -73,6 +73,12 @@ function friendlyError(err) {
   if (err && err.stalled) {
     return 'связь с сайтом подвисла — запрос не дошёл за отведённое время, попробуйте снова';
   }
+  /* 404 — это не опечатка в адресе, а потерянные временные файлы: сервер
+     перезапустился и уже не знает ни исходника, ни задачи. Молчаливое
+     «сервер ответил 404» тут бесполезно — человеку надо сказать, что делать. */
+  if (err && err.status === 404) {
+    return 'сервер перезапустился и потерял временные файлы — исходник и задача сброшены, загрузите видео заново';
+  }
   if (err && err.status === 413) {
     return 'прокси не пропускает тело запроса — возьмите файл поменьше или откройте сайт локально: cd app && npm start';
   }
@@ -706,7 +712,11 @@ async function pollJob() {
   try {
     const res = await fetchJson(`/api/jobs/${state.job.id}`);
     const data = await readJson(res);
-    if (!res.ok) throw new Error(data.error || `сервер ответил ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(notJsonHint(data) || data.error || `сервер ответил ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
     state.job = data.job;
     updateProgress(state.job);
     if (state.job.status === 'done' || state.job.status === 'error') {
