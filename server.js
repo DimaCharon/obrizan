@@ -147,7 +147,15 @@ function probe(file) {
 function videoFilter(opts) {
   const parts = [];
   if (opts && opts.enhance) parts.push('hqdn3d=1.5:1.5:6:6');
-  if (opts && opts.upscale) parts.push("scale=trunc(iw*2/2)*2:trunc(ih*2/2)*2:flags=lanczos");
+  if (opts && opts.upscale && opts.srcW && opts.srcH) {
+    /* ×2, но не выше 1440 по высоте: иначе 1080p уходит в 4K, а размер файлов
+       и время кодирования растут квадратично и выбивают диск и таймаут */
+    const h = Math.min(opts.srcH * 2, 1440);
+    if (h > opts.srcH) {
+      const w = Math.round((opts.srcW * h) / opts.srcH / 2) * 2;
+      parts.push(`scale=${w}:${h}:flags=lanczos`);
+    }
+  }
   if (opts && opts.enhance) parts.push('unsharp=5:5:0.6:5:5:0.0');
   return parts.join(',');
 }
@@ -178,18 +186,38 @@ function cutPiece(input, output, start, duration, mode, onProgress, opts) {
     args.push('-t', duration.toFixed(3));
 
     let settled = false;
+    const stderrTail = [];
     const cmd = ffmpeg(input)
       .inputOptions(['-ss', start.toFixed(3)])
       .outputOptions(args)
       .output(output)
       .on('start', (cli) => { if (process.env.DEBUG) console.log('  $', cli); })
+      .on('stderr', (line) => {
+        stderrTail.push(line);
+        if (stderrTail.length > 4) stderrTail.shift();
+      })
       .on('progress', (p) => {
         if (onProgress && p && typeof p.percent === 'number') {
           onProgress(Math.max(0, Math.min(100, p.percent)) / 100);
         }
       })
-      .on('end', () => { settled = true; resolve(); })
-      .on('error', (err) => { if (!settled) reject(err); });
+      .on('end', () => { settled = true; clearTimeout(timer); resolve(); })
+      .on('error', (err) => {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        const tail = stderrTail.filter(Boolean).slice(-2).join(' / ').slice(0, 300);
+        reject(new Error(tail || String((err && err.message) || err).split('\n')[0]));
+      });
+
+    /* зависший ffmpeg не должен держать очередь навсегда */
+    const timeoutMs = Math.max(10 * 60 * 1000, duration * 20 * 1000);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { cmd.kill('SIGKILL'); } catch (_) {}
+      reject(new Error('ffmpeg не уложился во время и был остановлен'));
+    }, timeoutMs);
 
     cmd.run();
   });
@@ -596,6 +624,8 @@ app.post('/api/cut', (req, res) => {
     mode: mode === 'fast' ? 'fast' : 'accurate',
     enhance: !!enhance,
     upscale: !!upscale,
+    srcW: meta.width || null,
+    srcH: meta.height || null,
     container,
     sourceFile: path.basename(path.join(UPLOAD_DIR, fileId, `source${meta.container ? '.' + meta.container : '.mp4'}`)),
     status: 'queued',
@@ -729,24 +759,25 @@ async function runJob(job) {
     persist(job);
 
     const out = path.join(piecesDir, r.file);
+    const fx = { enhance: job.enhance, upscale: job.upscale, srcW: job.srcW, srcH: job.srcH };
+    const runOnce = (m) => cutPiece(src, out, p.start, p.duration, m, (f) => {
+      job.progress = (i + f) / job.plan.length;
+      r.fraction = f;
+    }, fx);
     let ok = false;
+    let lastErr = null;
     try {
-      await cutPiece(src, out, p.start, p.duration, job.mode, (f) => {
-        job.progress = (i + f) / job.plan.length;
-        r.fraction = f;
-      }, { enhance: job.enhance, upscale: job.upscale });
+      await runOnce(job.mode);
       ok = fs.existsSync(out) && fs.statSync(out).size > 0;
     } catch (e) {
+      lastErr = e.message;
       if (job.mode === 'fast') {
         // потоковое копирование не всегда возможно — перекодируем этот кусок
         try {
-          await cutPiece(src, out, p.start, p.duration, 'accurate', (f) => {
-            job.progress = (i + f) / job.plan.length;
-            r.fraction = f;
-          }, { enhance: job.enhance, upscale: job.upscale });
+          await runOnce('accurate');
           ok = fs.existsSync(out) && fs.statSync(out).size > 0;
           r.note = 'перекодирован';
-        } catch (_) { /* оставим ошибку ниже */ }
+        } catch (e2) { lastErr = e2.message; }
       }
     }
 
@@ -756,7 +787,8 @@ async function runJob(job) {
       r.fraction = 1;
     } else {
       r.status = 'error';
-      r.error = 'ffmpeg не смог вырезать фрагмент';
+      r.error = lastErr ? `ffmpeg: ${lastErr}` : 'ffmpeg не смог вырезать фрагмент';
+      if (lastErr) console.log('ERR cut', job.id, r.file, '→', lastErr);
       try { fs.rmSync(out, { force: true }); } catch (_) {}
     }
 
@@ -840,13 +872,25 @@ async function restoreUploads() {
       const f = path.join(JOB_DIR, dir, 'status.json');
       if (!fs.existsSync(f)) continue;
       const job = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (job.status === 'queued' || job.status === 'running') {
+        job.status = 'error';
+        job.error = 'сервер перезапустился во время нарезки — запустите заново';
+        for (const r of job.results) {
+          if (r.status === 'running' || r.status === 'pending') {
+            r.status = 'error';
+            r.error = 'прервано перезапуском сервера';
+          }
+        }
+        job.finishedAt = Date.now();
+        try { fs.writeFileSync(f, JSON.stringify(job)); } catch (_) {}
+      }
       jobs.set(job.id, job);
     }
   } catch (_) {}
 })();
 
 /* чистка старых задач (старше 24 часов) */
-(function cleanup() {
+function cleanup() {
   const day = 24 * 3600 * 1000;
   for (const job of jobs.values()) {
     if (job.createdAt && Date.now() - job.createdAt > day) {
@@ -854,7 +898,9 @@ async function restoreUploads() {
       jobs.delete(job.id);
     }
   }
-})();
+}
+cleanup();
+setInterval(cleanup, 60 * 60 * 1000).unref();
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'нет такого метода' }));
 
