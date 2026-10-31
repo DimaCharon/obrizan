@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>НАРЕЗАТОР — режет видео на равные куски с перехлёстом</title>
+<meta name="description" content="Node + ffmpeg. Режет видео на равные части с перехлёстом на стыках, отдаёт куски и ZIP.">
+<style>
+  :root{
+    --ink:#0A0A0B; --ink-2:#0E0E10; --panel:#111113; --panel-2:#16161A; --panel-3:#1C1C21;
+    --line:rgba(255,255,255,.085); --line-2:rgba(255,255,255,.16);
+    --text:#EDEAE3; --text-2:#B7B4AC; --muted:#8B8880; --muted-2:#63615C;
+    --acc:#FF5A26; --acc-2:#FF7A4D; --acc-dim:rgba(255,90,38,.14);
+    --ok:#8FE3A6; --err:#FF6B5E;
+    --f-disp:'Unbounded','Inter',system-ui,sans-serif;
+    --f-sans:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+    --f-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--ink);color:var(--text);font-family:var(--f-sans);
+    -webkit-font-smoothing:antialiased}
+  body{overflow-x:hidden}
+  a{color:inherit}
+
+  /* фон: монтажная плёнка */
+  .bg{position:fixed;inset:0;z-index:0;pointer-events:none}
+  .bg::before{content:'';position:absolute;inset:0;
+    background:
+      radial-gradient(900px 520px at 78% -8%, rgba(255,90,38,.16), transparent 62%),
+      radial-gradient(700px 420px at 8% 108%, rgba(255,90,38,.07), transparent 60%);}
+  .bg::after{content:'';position:absolute;inset:0;opacity:.5;
+    background-image:repeating-linear-gradient(0deg,transparent 0 3px,rgba(255,255,255,.014) 3px 4px);}
+  .strip{position:absolute;left:0;right:0;height:26px;opacity:.5;
+    background-image:repeating-linear-gradient(90deg,transparent 0 22px,rgba(255,255,255,.06) 22px 24px)}
+  .strip.t{top:0}.strip.b{bottom:0}
+
+  .wrap{position:relative;z-index:1;max-width:940px;margin:0 auto;padding:0 22px 90px}
+
+  header{display:flex;align-items:center;justify-content:space-between;padding:30px 0 0}
+  .brand{display:flex;align-items:center;gap:11px;font-family:var(--f-disp);font-weight:800;
+    font-size:15px;letter-spacing:.14em;text-transform:uppercase}
+  .mark{width:26px;height:26px;border-radius:7px;background:linear-gradient(140deg,var(--acc),#C63D14);
+    display:grid;place-items:center;box-shadow:0 6px 20px rgba(255,90,38,.34)}
+  .mark svg{width:14px;height:14px}
+  .gh{display:inline-flex;align-items:center;gap:8px;padding:8px 15px;border-radius:999px;
+    border:1px solid var(--line-2);background:var(--panel-2);font-size:12.5px;font-weight:600;
+    text-decoration:none;transition:.18s}
+  .gh:hover{border-color:var(--acc);background:var(--acc-dim)}
+  .gh svg{width:15px;height:15px}
+
+  .hero{padding:74px 0 54px;text-align:left}
+  .tag{display:inline-flex;align-items:center;gap:8px;padding:6px 13px;border-radius:999px;
+    border:1px solid var(--line-2);background:var(--panel-2);font-family:var(--f-mono);
+    font-size:11px;color:var(--text-2);letter-spacing:.04em}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+  h1{font-family:var(--f-disp);font-weight:800;letter-spacing:-.03em;line-height:1.02;
+    font-size:clamp(38px,7.4vw,74px);margin:22px 0 0}
+  h1 em{font-style:normal;color:var(--acc)}
+  .lead{color:var(--text-2);font-size:clamp(15px,2.1vw,18.5px);line-height:1.62;
+    max-width:620px;margin:22px 0 0}
+  .cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:34px}
+  .btn{display:inline-flex;align-items:center;gap:9px;padding:13px 22px;border-radius:12px;
+    font-size:14px;font-weight:650;text-decoration:none;border:1px solid transparent;transition:.18s}
+  .btn-p{background:linear-gradient(140deg,var(--acc),#E4480F);color:#fff;
+    box-shadow:0 10px 30px rgba(255,90,38,.3)}
+  .btn-p:hover{transform:translateY(-1px);box-shadow:0 14px 36px rgba(255,90,38,.42)}
+  .btn-s{border-color:var(--line-2);background:var(--panel-2);color:var(--text)}
+  .btn-s:hover{border-color:var(--acc);background:var(--acc-dim)}
+  code{font-family:var(--f-mono);font-size:.88em;background:var(--panel-3);
+    border:1px solid var(--line);border-radius:6px;padding:2px 7px;color:var(--acc-2)}
+
+  section{margin-top:66px}
+  h2{font-family:var(--f-disp);font-weight:700;font-size:13px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 20px}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(238px,1fr));gap:14px}
+  .card{background:linear-gradient(170deg,var(--panel-2),var(--panel));border:1px solid var(--line);
+    border-radius:16px;padding:22px;transition:.2s}
+  .card:hover{border-color:var(--line-2);transform:translateY(-2px)}
+  .card h3{font-family:var(--f-disp);font-size:15px;font-weight:700;margin:0 0 8px}
+  .card p{color:var(--text-2);font-size:13.5px;line-height:1.6;margin:0}
+  .ico{width:34px;height:34px;border-radius:10px;background:var(--acc-dim);
+    border:1px solid rgba(255,90,38,.24);display:grid;place-items:center;margin-bottom:14px}
+  .ico svg{width:17px;height:17px;stroke:var(--acc)}
+
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--line)}
+  th{font-family:var(--f-disp);font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;
+    color:var(--muted);font-weight:600}
+  td{color:var(--text-2)}
+  td.n{font-family:var(--f-mono);color:var(--text);text-align:right;white-space:nowrap}
+  tr:last-child td{border-bottom:0}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-family:var(--f-mono);
+    font-size:10.5px;border:1px solid var(--line-2)}
+  .pill.f{color:var(--ok);border-color:rgba(143,227,166,.3);background:rgba(143,227,166,.08)}
+  .pill.a{color:var(--acc-2);border-color:rgba(255,122,77,.3);background:var(--acc-dim)}
+
+  .note{background:linear-gradient(170deg,rgba(255,90,38,.09),rgba(255,90,38,.03));
+    border:1px solid rgba(255,90,38,.26);border-radius:16px;padding:24px}
+  .note h3{font-family:var(--f-disp);font-size:15px;margin:0 0 10px;color:var(--acc-2)}
+  .note p{color:var(--text-2);font-size:13.5px;line-height:1.65;margin:0 0 12px}
+  .note p:last-child{margin:0}
+  .steps{counter-reset:s;list-style:none;padding:0;margin:16px 0 0}
+  .steps li{counter-increment:s;position:relative;padding-left:34px;margin-bottom:11px;
+    color:var(--text-2);font-size:13.5px;line-height:1.6}
+  .steps li::before{content:counter(s);position:absolute;left:0;top:1px;width:22px;height:22px;
+    border-radius:7px;background:var(--panel-3);border:1px solid var(--line-2);color:var(--acc-2);
+    font-family:var(--f-mono);font-size:11px;display:grid;place-items:center}
+
+  .opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;margin-top:16px}
+  .opt{background:var(--panel-2);border:1px solid var(--line);border-radius:13px;padding:17px}
+  .opt b{display:block;font-size:13.5px;margin-bottom:5px}
+  .opt span{color:var(--muted);font-size:12.5px;line-height:1.55}
+
+  footer{margin-top:74px;padding-top:26px;border-top:1px solid var(--line);
+    display:flex;flex-wrap:wrap;gap:14px;justify-content:space-between;
+    color:var(--muted-2);font-size:12px}
+  @media(max-width:620px){ .hero{padding:48px 0 36px} section{margin-top:48px} }
+</style>
+</head>
+<body>
+<div class="bg"><div class="strip t"></div><div class="strip b"></div></div>
+
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <span class="mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round">
+          <path d="M4 6h16M4 12h16M4 18h16"/><path d="M9 3v18M15 3v18" stroke-width="1.4" opacity=".55"/>
+        </svg>
+      </span>
+      нарезатор
+    </div>
+    <a class="gh" href="https://github.com/DimaCharon/obrizan">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+      исходники
+    </a>
+  </header>
+
+  <div class="hero">
+    <span class="tag"><span class="dot"></span>node · express · ffmpeg · без регистрации</span>
+    <h1>Режет видео<br>на равные куски<br><em>с перехлёстом</em></h1>
+    <p class="lead">
+      Загрузите файл — получите равные части, где каждая следующая захватывает
+      кусочек предыдущей. Чтобы при склейке не было разрывов на стыках.
+      Отдаёт каждый кусок отдельно и всё архивом.
+    </p>
+    <div class="cta">
+      <a class="btn btn-p" href="https://github.com/DimaCharon/obrizan">
+        забрать с github
+      </a>
+      <a class="btn btn-s" href="#run">как запустить</a>
+    </div>
+  </div>
+
+  <section>
+    <h2>что умеет</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h10M4 18h16"/></svg></div>
+        <h3>перехлёст на стыках</h3>
+        <p>0.5, 1, 1.5 или 2 секунды. Первый кусок короче ровно на перехлёст — математика видна в таймлайне до нарезки.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M3 12h18"/></svg></div>
+        <h3>от 2 до 80 кусков</h3>
+        <p>Минимум 1.5 секунды на кусок — если просите больше, сайт скажет, а не выдаст мусор.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg></div>
+        <h3>два режима</h3>
+        <p><b>Быстро</b> — копирование потока, границы по ключевым кадрам, качество 1:1. <b>Точно</b> — покадрово, crf 16, качество не отличить от исходника.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg></div>
+        <h3>улучшение картинки</h3>
+        <p>Шумодав и резкость от ffmpeg, плюс подъём разрешения ×2. Бесплатно, без моделей и скачиваний.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>замеры — клип 5 минут, 854×480</h2>
+    <table>
+      <thead><tr><th>режим</th><th class="n" style="text-align:right">время</th><th class="n" style="text-align:right">вес</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pill f">быстро</span> 80 кусков</td><td class="n">7.4 с</td><td class="n">90 МБ</td></tr>
+        <tr><td><span class="pill a">точно</span> 80 кусков</td><td class="n">60 с</td><td class="n">65 МБ</td></tr>
+        <tr><td><span class="pill a">точно</span> 10 кусков + улучшить + ×2</td><td class="n">173 с</td><td class="n">189 МБ</td></tr>
+        <tr><td>87 минут, 9 кусков, точно + улучшить</td><td class="n">1075 с</td><td class="n">712 МБ</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="run">
+    <div class="note">
+      <h3>Почему на этой странице нет самой нарезки</h3>
+      <p>
+        GitHub Pages раздаёт только статические файлы — HTML, CSS, JS. Нарезке
+        нужен Node-сервер и ffmpeg: видео режется на машине, а не в браузере.
+        Через Pages открылся бы интерфейс, но каждый запрос к <code>/api/…</code>
+        отвечал бы 404.
+      </p>
+      <p>
+        Это ограничение платформы, а не баг программы. Полноценный сайт запускается
+        в три команды:
+      </p>
+      <ol class="steps">
+        <li>Нужен <b>Node.js 18 или новее</b> — ffmpeg уже вложен в зависимости, ставить отдельно ничего не надо.</li>
+        <li><code>git clone https://github.com/DimaCharon/obrizan.git &amp;&amp; cd obrizan</code></li>
+        <li><code>./start.sh</code> — откроется на <code>http://localhost:4173</code></li>
+      </ol>
+      <p style="margin-top:14px">
+        Скрипт сам доставит зависимости и поднимет сервер заново, если процесс упадёт.
+      </p>
+    </div>
+
+    <h2 style="margin-top:34px">если нужен сайт в интернете</h2>
+    <div class="opts">
+      <div class="opt"><b>Render / Railway / Fly.io</b><span>Бесплатно или почти бесплатно, деплой прямо из репозитория. Node и ffmpeg там есть.</span></div>
+      <div class="opt"><b>VPS</b><span>Свой сервер с SSH: <code>git clone</code>, <code>./start.sh</code>, nginx перед ним. Никаких лимитов на размер видео.</span></div>
+      <div class="opt"><b>виртуальный хостинг</b><span>Там, где есть Node.js-приложения. В панели: команда <code>npm start</code>, порт из <code>PORT</code>.</span></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>нарезатор · node + express + ffmpeg</span>
+    <span>лицензия ISC · <a href="https://github.com/DimaCharon/obrizan" style="color:var(--acc-2)">github.com/DimaCharon/obrizan</a></span>
+  </footer>
+</div>
+</body>
+</html>
